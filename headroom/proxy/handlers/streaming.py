@@ -10,7 +10,6 @@ import contextlib
 import json
 import logging
 import time
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.helpers import compute_turn_id, jitter_delay_ms
@@ -585,7 +584,7 @@ class StreamingMixin:
         full_sse_data: str = "",
         parsed_response: dict[str, Any] | None = None,
     ) -> None:
-        from headroom.proxy.cost import _summarize_transforms
+        from headroom.proxy.outcome import RequestOutcome
 
         total_latency = (time.time() - start_time) * 1000
 
@@ -647,23 +646,9 @@ class StreamingMixin:
             effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
         )
 
-        num_msgs = len(body.get("messages", []))
-        cache_hit_pct = (
-            round(cache_read_tokens / (cache_read_tokens + cache_write_tokens) * 100)
-            if (cache_read_tokens + cache_write_tokens) > 0
-            else 0
-        )
-        logger.info(
-            f"[{request_id}] PERF "
-            f"model={model} msgs={num_msgs} "
-            f"tok_before={effective_original_tokens} tok_after={effective_optimized_tokens} "
-            f"tok_saved={tokens_saved} "
-            f"cache_read={cache_read_tokens} cache_write={cache_write_tokens} "
-            f"cache_hit_pct={cache_hit_pct} "
-            f"opt_ms={optimization_latency:.0f} "
-            f"transforms={_summarize_transforms(transforms_applied)}"
-        )
-
+        # Prefix-tracker mutation is provider-specific state that lives
+        # outside the metric funnel. Run it before the funnel so the next
+        # request inherits correct prefix state regardless of metric path.
         if prefix_tracker is not None:
             import copy as _copy
 
@@ -690,76 +675,40 @@ class StreamingMixin:
                 original_messages=next_original,
             )
 
-        if self.cost_tracker:
-            self.cost_tracker.record_tokens(
-                model,
-                tokens_saved,
-                effective_optimized_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                cache_write_5m_tokens=cache_write_5m_tokens,
-                cache_write_1h_tokens=cache_write_1h_tokens,
-                uncached_tokens=uncached_input_tokens,
-            )
+        # Active-compression denominator. No frozen_message_count is
+        # propagated to the streaming finalizer yet, so we fall back to
+        # the pre-comp request size (effective_optimized + tokens_saved).
+        # Per-message live-zone tracking is a follow-up; without this
+        # fallback the dashboard headline collapses to 0% for streaming
+        # traffic even though compression is happening (issue #455).
+        attempted_input_tokens = effective_optimized_tokens + tokens_saved
 
-        if getattr(self, "metrics", None) is not None:
-            # Active-compression denominator. No frozen_message_count is
-            # propagated to the streaming finalizer yet, so we fall
-            # back to the pre-comp request size (effective_optimized +
-            # tokens_saved). Per-message live-zone tracking is a
-            # follow-up; without this fallback the dashboard headline
-            # collapses to 0% for streaming traffic even though
-            # compression is happening (issue #455).
-            attempted_input_tokens = effective_optimized_tokens + tokens_saved
-            await self.metrics.record_request(
-                provider=provider,
-                model=model,
-                input_tokens=effective_optimized_tokens,
-                output_tokens=output_tokens,
-                tokens_saved=tokens_saved,
-                latency_ms=total_latency,
-                overhead_ms=optimization_latency,
-                ttfb_ms=stream_state["ttfb_ms"] or total_latency,
-                pipeline_timing=pipeline_timing,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                cache_write_5m_tokens=cache_write_5m_tokens,
-                cache_write_1h_tokens=cache_write_1h_tokens,
-                uncached_input_tokens=uncached_input_tokens,
-                attempted_input_tokens=attempted_input_tokens,
-            )
-
-        # Log the request to the in-memory request logger so it shows up in
-        # /stats `recent_requests` and `/transformations/feed`. Without this
-        # the streaming Anthropic path (which is what Claude Code uses) is
-        # invisible to both surfaces — only Bedrock streaming and the
-        # non-streaming Anthropic path were logged previously.
-        if getattr(self, "logger", None) is not None:
-            from headroom.proxy.models import RequestLog
-
-            self.logger.log(
-                RequestLog(
-                    request_id=request_id,
-                    timestamp=datetime.now().isoformat(),
-                    provider=provider,
-                    model=model,
-                    input_tokens_original=effective_original_tokens,
-                    input_tokens_optimized=effective_optimized_tokens,
-                    output_tokens=output_tokens,
-                    tokens_saved=tokens_saved,
-                    savings_percent=(tokens_saved / effective_original_tokens * 100)
-                    if effective_original_tokens > 0
-                    else 0,
-                    optimization_latency_ms=optimization_latency,
-                    total_latency_ms=total_latency,
-                    tags=tags or {},
-                    cache_hit=False,
-                    transforms_applied=transforms_applied,
-                    request_messages=body.get("messages")
-                    if getattr(self.config, "log_full_messages", False)
-                    else None,
-                )
-            )
+        outcome = RequestOutcome(
+            request_id=request_id,
+            provider=provider,
+            model=model,
+            original_tokens=effective_original_tokens,
+            optimized_tokens=effective_optimized_tokens,
+            output_tokens=output_tokens,
+            tokens_saved=tokens_saved,
+            attempted_input_tokens=attempted_input_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_write_5m_tokens=cache_write_5m_tokens,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+            total_latency_ms=total_latency,
+            overhead_ms=optimization_latency,
+            ttfb_ms=stream_state["ttfb_ms"] or total_latency,
+            pipeline_timing=pipeline_timing,
+            transforms_applied=tuple(transforms_applied),
+            num_messages=len(body.get("messages", [])),
+            tags=tags or {},
+            request_messages=body.get("messages")
+            if getattr(self.config, "log_full_messages", False)
+            else None,
+        )
+        await self._record_request_outcome(outcome)
 
     async def _stream_response(
         self,
@@ -1298,8 +1247,7 @@ class StreamingMixin:
         """
         from fastapi.responses import StreamingResponse
 
-        from headroom.proxy.cost import _summarize_transforms
-        from headroom.proxy.models import RequestLog
+        from headroom.proxy.outcome import RequestOutcome
 
         start_time = time.time()
 
@@ -1367,19 +1315,7 @@ class StreamingMixin:
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
             finally:
-                # Record metrics
                 total_latency = (time.time() - start_time) * 1000
-                output_tokens = stream_state["output_tokens"]
-                cache_read_tokens = stream_state["cache_read_input_tokens"]
-                cache_write_tokens = stream_state["cache_creation_input_tokens"]
-                cache_write_5m_tokens = stream_state["cache_creation_ephemeral_5m_input_tokens"]
-                cache_write_1h_tokens = stream_state["cache_creation_ephemeral_1h_input_tokens"]
-                cache_hit_pct = (
-                    round(cache_read_tokens / (cache_read_tokens + cache_write_tokens) * 100)
-                    if (cache_read_tokens + cache_write_tokens) > 0
-                    else 0
-                )
-
                 _backend_name = (
                     self.anthropic_backend.name if self.anthropic_backend else "anthropic"
                 )
@@ -1387,73 +1323,32 @@ class StreamingMixin:
                 # Bedrock streaming doesn't propagate frozen_message_count
                 # here either; without this, attempted_input_tokens_total
                 # stays 0 and the dashboard headline reads 0% (#455).
-                attempted_input_tokens = optimized_tokens + tokens_saved
-                await self.metrics.record_request(
+                outcome = RequestOutcome(
+                    request_id=request_id,
                     provider=_backend_name,
                     model=model,
-                    input_tokens=optimized_tokens,
-                    output_tokens=output_tokens,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    output_tokens=stream_state["output_tokens"],
                     tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    cached=cache_read_tokens > 0,
+                    attempted_input_tokens=optimized_tokens + tokens_saved,
+                    cache_read_tokens=stream_state["cache_read_input_tokens"],
+                    cache_write_tokens=stream_state["cache_creation_input_tokens"],
+                    cache_write_5m_tokens=stream_state["cache_creation_ephemeral_5m_input_tokens"],
+                    cache_write_1h_tokens=stream_state["cache_creation_ephemeral_1h_input_tokens"],
+                    total_latency_ms=total_latency,
                     overhead_ms=optimization_latency,
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
-                    attempted_input_tokens=attempted_input_tokens,
+                    transforms_applied=tuple(transforms_applied),
+                    num_messages=len(body.get("messages", [])),
+                    tags=tags or {},
+                    turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
+                    request_messages=body.get("messages")
+                    if getattr(self.config, "log_full_messages", False)
+                    else None,
                 )
-
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        optimized_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        cache_write_5m_tokens=cache_write_5m_tokens,
-                        cache_write_1h_tokens=cache_write_1h_tokens,
-                    )
-
-                # Log request
-                if self.logger:
-                    self.logger.log(
-                        RequestLog(
-                            request_id=request_id,
-                            timestamp=datetime.now().isoformat(),
-                            provider=_backend_name,
-                            model=model,
-                            input_tokens_original=original_tokens,
-                            input_tokens_optimized=optimized_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            savings_percent=(tokens_saved / original_tokens * 100)
-                            if original_tokens > 0
-                            else 0,
-                            optimization_latency_ms=optimization_latency,
-                            total_latency_ms=total_latency,
-                            tags=tags,
-                            cache_hit=cache_read_tokens > 0,
-                            transforms_applied=transforms_applied,
-                            request_messages=body.get("messages")
-                            if self.config.log_full_messages
-                            else None,
-                            turn_id=compute_turn_id(
-                                model, body.get("system"), body.get("messages")
-                            ),
-                        )
-                    )
-
-                # Structured perf log line for `headroom perf` analysis
-                num_msgs = len(body.get("messages", []))
-                logger.info(
-                    f"[{request_id}] PERF "
-                    f"model={model} msgs={num_msgs} "
-                    f"tok_before={original_tokens} tok_after={optimized_tokens} "
-                    f"tok_saved={tokens_saved} "
-                    f"cache_read={cache_read_tokens} cache_write={cache_write_tokens} "
-                    f"cache_hit_pct={cache_hit_pct} "
-                    f"opt_ms={optimization_latency:.0f} "
-                    f"transforms={_summarize_transforms(transforms_applied)}"
-                )
+                await self._record_request_outcome(outcome)
 
         return StreamingResponse(
             generate(),
@@ -1493,8 +1388,8 @@ class StreamingMixin:
         """
         from fastapi.responses import StreamingResponse
 
-        from headroom.proxy.cost import _summarize_transforms
         from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
+        from headroom.proxy.outcome import RequestOutcome
 
         assert self.anthropic_backend is not None
 
@@ -1555,19 +1450,15 @@ class StreamingMixin:
                 output_tokens = stream_state["output_tokens"] or 0
                 cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
                 if upstream_input is None:
-                    input_tokens = 0
                     cache_write_tokens = 0
                     uncached_input_tokens = 0
-                    cache_hit_pct = 0
+                    cache_inferred = False
                 else:
-                    input_tokens = upstream_input
                     cache_write_tokens = _infer_openai_cache_write_tokens(
-                        input_tokens, cache_read_tokens
+                        upstream_input, cache_read_tokens
                     )
-                    uncached_input_tokens = max(input_tokens - cache_read_tokens, 0)
-                    cache_hit_pct = (
-                        round(cache_read_tokens / input_tokens * 100) if input_tokens > 0 else 0
-                    )
+                    uncached_input_tokens = max(upstream_input - cache_read_tokens, 0)
+                    cache_inferred = True
 
                 total_latency = (time.time() - start_time) * 1000
                 # Active-compression denominator for backend-routed
@@ -1577,78 +1468,31 @@ class StreamingMixin:
                 # comp request size. This keeps active_savings_percent
                 # in sync with proxy_savings_percent for this provider
                 # instead of collapsing the dashboard headline to 0%.
-                attempted_input_tokens = optimized_tokens + tokens_saved
-                await self.metrics.record_request(
+                outcome = RequestOutcome(
+                    request_id=request_id,
                     provider=self.anthropic_backend.name,
                     model=model,
-                    input_tokens=optimized_tokens,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    cached=cache_read_tokens > 0,
+                    attempted_input_tokens=optimized_tokens + tokens_saved,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    uncached_input_tokens=uncached_input_tokens,
+                    cache_inferred=cache_inferred,
+                    total_latency_ms=total_latency,
                     overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
                     waste_signals=waste_signals,
-                    attempted_input_tokens=attempted_input_tokens,
+                    transforms_applied=tuple(transforms_applied),
+                    num_messages=len(body.get("messages", [])),
+                    tags=tags or {},
+                    request_messages=body.get("messages")
+                    if getattr(self.config, "log_full_messages", False)
+                    else None,
                 )
-
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        optimized_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
-
-                # Mirror the Anthropic-stream path: log to RequestLogger so
-                # /stats.recent_requests and /transformations/feed see this
-                # request. Without it the OpenAI-via-backend path is invisible.
-                if getattr(self, "logger", None) is not None:
-                    from headroom.proxy.models import RequestLog
-
-                    self.logger.log(
-                        RequestLog(
-                            request_id=request_id,
-                            timestamp=datetime.now().isoformat(),
-                            provider=self.anthropic_backend.name,
-                            model=model,
-                            input_tokens_original=original_tokens,
-                            input_tokens_optimized=optimized_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            savings_percent=(tokens_saved / original_tokens * 100)
-                            if original_tokens > 0
-                            else 0,
-                            optimization_latency_ms=optimization_latency,
-                            total_latency_ms=total_latency,
-                            tags=tags or {},
-                            cache_hit=cache_read_tokens > 0,
-                            transforms_applied=transforms_applied,
-                            waste_signals=waste_signals,
-                            request_messages=body.get("messages")
-                            if getattr(self.config, "log_full_messages", False)
-                            else None,
-                        )
-                    )
-
-                # Structured perf log line for `headroom perf` analysis.
-                # Missing this line is why issue #327 reported
-                # ``Cache write: 0`` on Azure-GPT/Codex backend-routed
-                # traffic: the entire request was invisible to the perf
-                # parser, not zero — but the symptom is identical.
-                num_msgs = len(body.get("messages", []))
-                logger.info(
-                    f"[{request_id}] PERF "
-                    f"model={model} msgs={num_msgs} "
-                    f"tok_before={original_tokens} tok_after={optimized_tokens} "
-                    f"tok_saved={tokens_saved} "
-                    f"cache_read={cache_read_tokens} cache_write={cache_write_tokens} "
-                    f"cache_hit_pct={cache_hit_pct} "
-                    f"opt_ms={optimization_latency:.0f} "
-                    f"transforms={_summarize_transforms(transforms_applied)}"
-                )
+                await self._record_request_outcome(outcome)
 
                 if tokens_saved > 0:
                     logger.info(
